@@ -1,0 +1,177 @@
+---
+title: "AnomalyDetection"
+author: "Balti Boix"
+date: "27 de julio de 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Anomaly Detection en una Unidad de Proceso
+
+Proyecto para la detección de anomalías en una Unidad de Proceso. Se utilizan los tags de la Unidad 611.
+      
+      
+
+#### Cargamos las librarias que vamos a utilizar
+
+
+```{r libraries, warning=FALSE, message=FALSE}
+require(FactoMineR)
+require(missMDA)
+require(fitdistrplus)
+require(ggplot2)
+require(lubridate)
+require(dplyr)
+require(zoo)
+source('~/RProjects/PI2R/zoogvisLineChart.R')
+```
+
+
+#### Definimos las constantes que utilizaremos
+
+
+```{r Constantes}
+timeformats<-c("%d/%m/%Y %H:%M:%S", "%d/%m/%Y", "%d/%m/%Y %H:%M")
+tagtypes<-c('AI', 'AC', 'EI', 'FC', 'FI', 'FX', 'GM', 'HC', 'II', 'KM', 'LC', 'LI', 'PC', 'PI', 'PDI', 'TC', 'TI')
+tagpattern <- paste0('^(\\d\\d(', paste(tagtypes, collapse ='|'), '))')
+#tagpattern1 <- '.(SP|OP)$'
+tagpattern1 <- '.(SP)$'
+tIniCycle <- 2011.2
+```
+
+#### Leemos el fichero de las propiedades delos Tags
+
+```{r}
+tagnames<-read.delim('Properties', encoding='Spanish_Spain.1252', stringsAsFactors = FALSE, header = TRUE)
+
+```
+
+#### Leemos el fichero de datos de las medias
+
+```{r}
+meandata0<-read.delim('Mean_2015', encoding='Spanish_Spain.1252', stringsAsFactors = FALSE, header = TRUE)
+meandata<-read.delim('Mean', encoding='Spanish_Spain.1252', stringsAsFactors = FALSE, header = TRUE)
+meandata <- rbind(meandata0, meandata)
+remove(meandata0)
+names(meandata)[1]<-'t'
+```
+
+#### Pre-procesamos los datos de las medias
+
+Seleccionamos los tags del tipo especificado en `tagpattern` y eliminamos los que terminan en `tagpattern1`.
+
+Cambiamos las `,` por `.` para que R entienda los datos como números y las fechas como tales.
+
+Eliminamos los tags con `SD = 0` y los que tienen menos de un 95% de datos válidos.
+
+Tambien eliminamos los tags con datos duplicados.
+
+Damos nombre a cada observación con la fecha de la misma y transformamos la variable `t` en el tiempo en años desde la PEM tras parada general.
+
+```{r warning=FALSE}
+meandata <- meandata %>%
+      select(t, one_of(paste0('X',tagnames$Tag[grep(tagpattern, tagnames$Tag)]))) %>%
+      select(-one_of(paste0('X',tagnames$Tag[grep(tagpattern1, tagnames$Tag)]))) %>%
+      mutate_each(funs(as.numeric(sub(',', '.', .))),-t) %>% 
+      mutate(t=parse_date_time(t, timeformats)) %>%
+      select(t, which(apply(., 2, function(x) sd(x, na.rm=TRUE))!=0)) %>%
+      select(t, which(colSums(is.na(.))/nrow(.)<0.05))
+
+meandata <- meandata[,!duplicated(t(meandata))]
+
+rownames(meandata) <- meandata$t
+meandata$t <- decimal_date(meandata$t) - tIniCycle
+
+```
+
+#### Estimamos los datos no disponibles
+
+```{r}
+#meandata <-imputePCA(meandata)$completeObs
+#saveRDS(meandata, file="meandata.RDS")
+meandata<-readRDS(file="meandata.RDS")
+meandata.z<-zoo(x=meandata, order.by = as.POSIXct(rownames(meandata)))
+g<-zoogvisLineChart( meandata.z[,c('X11FC0229', 'X11FC0230', 'X11FCARGA', 'X11FC0229')])
+plot(g)
+```
+
+#### Comprobamos la "Normalidad" de los datos
+
+Vamos a utilizar un modelo de distribución gaussiano multivariable para detectar anomalías. Este modelo requiere que las variables tengan una distribución "Normal". Utilizamos el test de Shapiro-Wilk para comprobarlo.
+
+
+El p.value del test lo cumplen muy pocas variables por lo que utilizamos el estadístico W para tener una aproximación:
+
+```{r}
+meandata.shapiro <- as.data.frame(meandata) %>% sample_n(5000) %>% summarize_each(funs(shapiro.test(.)$statistic))
+table(cut(as.numeric(meandata.shapiro), c(0,0.75,0.8,0.85,0.9,0.95,1)))/ncol(meandata)*100
+```
+**Habrá que transformar las variables para hacerlas más "Normales"!!!!**
+
+#### Reducimos la dimensión del problema
+
+Aplicamos la técnica PCA (Principal Component Analysis) para reducir el tamaño del problema manteniendo la mayor parte de la varianza. La idea es que las variables que están correlacionadas aportan la misma información y por tanto se puede reducir su número.
+
+```{r}
+data.pca <- PCA(meandata, ncp=75, graph = FALSE)
+knitr::kable(data.pca$eig[c(1, 2, 5, 10 , 25, 50, 75, 100, 250),])
+```
+
+Con menos de 100 componentes recogemos más del 90% de la varianza de las `r ncol(meandata)` variables originales.
+
+Comprobamos la "normalidad" de los nuevos componentes
+
+```{r results='hold'}
+data <- as.data.frame(data.pca$ind$coord)
+data.shapiro <- data  %>% sample_n(5000) %>% summarize_each(funs(shapiro.test(.)$statistic))
+table(cut(as.numeric(data.shapiro), c(0,0.75,0.8,0.85,0.9,0.95,1)))/ ncol(data.pca$ind$coord)*100
+table(cut(as.numeric(data.shapiro), c(0,0.9,0.95,0.97,0.99,1)))/ ncol(data.pca$ind$coord)*100
+```
+
+Mejora significativamente.
+
+Comprobamos que distribución se ajusta mejor en los extremos (5% y 95%): Normal o Weibull
+
+```{r}
+deltabic<-data %>% 
+          mutate_all(funs(.-min(.)+1)) %>%
+          summarize_all(funs(fitdist(., 'norm', method='qme', probs=c(0.05, 0.95))$bic-
+                             fitdist(., 'weibull', method='qme', probs=c(0.05, 0.95))$bic))
+
+```
+
+En `r sum(deltabic<0)` variables se ajusta mejor la distribución Normal. En `r sum(deltabic>0)` la Weibull. Nos quedamos con la Normal.
+
+El primer componente está muy correlacionado con la Carga a la Unidad:
+
+```{r}
+d1<-dimdesc(data.pca, axes =1)
+d1 <- left_join(data.frame(Tag=substring(as.character(rownames(d1$Dim.1$quanti[1:20,])),2), 
+                     d1$Dim.1$quanti[1:20,], stringsAsFactors = FALSE), tagnames)
+knitr::kable(d1)
+```
+
+El segundo componente está muy correlacionado con :
+
+```{r}
+d2<-dimdesc(data.pca, axes =2)
+d2 <- left_join(data.frame(Tag=substring(as.character(rownames(d2$Dim.2$quanti[1:20,])),2), 
+                     d2$Dim.2$quanti[1:20,], stringsAsFactors = FALSE), tagnames)
+knitr::kable(d2)
+```
+
+#### Aplicamos el modelo "multivariate Gaussian distribution"
+
+En nuestro caso las variables provinientes de una descomposición en componentes principales son ortogonales entre sí. La matriz de la covarianza será, por tanto, diagonal. Si escalamos la variables de forma que tengan todas media 0 y desviación standard 1, los elementos de la diagonal serán igual a 1. La densidad de probabilidad de una observación sera igual al producto de las densidades de probabilidad de cada variable en la observación. 
+
+```{r fig.height=9, fig.width=12}
+data.scaled<-scale(data)
+d <- as.data.frame(data.scaled) %>% mutate_all(funs(dnorm(., log=TRUE)))
+rownames(d) <- rownames(data)
+d.z <- zoo(x=rowSums(d), order.by = ymd_hms(rownames(d)))
+autoplot(d.z) +facet_free()+xlab("fecha")
+```
+
