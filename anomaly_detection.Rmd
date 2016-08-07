@@ -92,7 +92,8 @@ meandata$t <- decimal_date(meandata$t) - tIniCycle
 ```{r}
 #meandata <-imputePCA(meandata)$completeObs
 #saveRDS(meandata, file="meandata.RDS")
-meandata<-readRDS(file="meandata.RDS")
+meandata<-as.data.frame(readRDS(file="meandata.RDS"))
+meandata<-meandata[meandata$X11FC0229 > 250 & meandata$X11FC0230 > 250 & meandata$X11TI0102 > 250,]
 meandata.z<-zoo(x=meandata, order.by = as.POSIXct(rownames(meandata)))
 g<-zoogvisLineChart( meandata.z[,c('X11FC0229', 'X11FC0230', 'X11FCARGA', 'X11FC0229')])
 plot(g)
@@ -173,5 +174,17 @@ d <- as.data.frame(data.scaled) %>% mutate_all(funs(dnorm(., log=TRUE)))
 rownames(d) <- rownames(data)
 d.z <- zoo(x=rowSums(d), order.by = ymd_hms(rownames(d)))
 autoplot(d.z) +facet_free()+xlab("fecha")
+quantile(d.z, c(0.01,0.025, 0.05, 0.1))
+g<-zoogvisLineChart(d.z)
+plot(g)
+d.g<- d %>% 
+      mutate(t=ymd_hms(rownames(.))) %>%
+      filter(t < ymd_hms('2015-02-01 00:00:00')) %>%
+      gather(key, value, -t)
+d.g$key<-factor(d.g$key, levels =  paste0("Dim.", 1:75))
+g<-ggplot(d.g, aes(x=t,y=key))+geom_tile(aes(fill=abs(value)))
+g<-g + scale_fill_gradient(limits=c(0, 3),low = "green", high = "yellow", na.value = "red")
+g<-g + scale_y_discrete(labels = NULL)
+plot(g)
 ```
 
